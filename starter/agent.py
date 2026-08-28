@@ -14,7 +14,7 @@ STOPWORDS = {
 }
 
 
-def _text(value: object) -> str:
+def _text(value: object) -> str: #turns every input into string
     if value is None:
         return ""
     if isinstance(value, dict):
@@ -24,7 +24,7 @@ def _text(value: object) -> str:
     return str(value)
 
 
-def _terms(text: str) -> list[str]:
+def _terms(text: str) -> list[str]:  #removes useless words
     return [
         token.lower()
         for token in TOKEN_RE.findall(text)
@@ -38,8 +38,8 @@ class Agent:
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
         self.catalog_path = Path(catalog_path)
         self.connection = sqlite3.connect(":memory:")
-        self._sessions: set[str] = set()
-        self._build_index()
+        self._sessions: dict[str, dict] = {} #create dict to remember prev inputs
+        self._build_index() #loads all Amazon products into database
 
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
@@ -70,9 +70,12 @@ class Agent:
             cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
         self.connection.commit()
 
-    def reset(self, session_id: str, user_profile: dict) -> None:
+    def reset(self, session_id: str, user_profile: dict) -> None: #starts new shopper conversation
         # The profile is anonymized and may be used for personalization.
-        self._sessions.add(session_id)
+        self._sessions[session_id] = {
+            "messages":[],
+            "profile": user_profile,
+        }
 
     def respond(
         self,
@@ -83,20 +86,25 @@ class Agent:
     ) -> dict:
         if session_id not in self._sessions:
             raise RuntimeError("reset must be called before respond")
-        unique_terms = list(dict.fromkeys(_terms(user_message)))[:40]
-        expression = " OR ".join(f'"{term}"' for term in unique_terms)
-        if not expression:
+        state = self._sessions[session_id]
+        state["messages"].append(user_message)
+        query = " ".join(state["messages"])
+        unique_terms = list(dict.fromkeys(_terms(query)))[:40]
+        
+        expression = " OR ".join(f'"{term}"' for term in unique_terms) #Find products containing running OR shoes OR black e.g
+
+        if not expression: #If the user somehow gives no useful search words, No products given
             recommendations: list[dict] = []
-        else:
+        else: #findd relevant products
             rows = self.connection.execute(
                 "SELECT parent_asin FROM products WHERE products MATCH ? "
-                "ORDER BY bm25(products, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0) LIMIT ?",
+                "ORDER BY bm25(products, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0) LIMIT ?", #ordering by bm25 --> weights for the columns parent_asin, title etc
                 (expression, top_k),
             ).fetchall()
             recommendations = [{"parent_asin": str(row[0])} for row in rows]
         return {
             "message": "Here are the closest matches I found.",
-            "ask_attribute": None,
+            "ask_attribute": None, #not asking shopper any question
             "recommendations": recommendations,
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0}, #0 because not using LLM right now
         }
