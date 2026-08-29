@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from pathlib import Path
 
 import numpy as np
+from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
+
+try:
+    from openai import OpenAI
+except ImportError:  # keeps the agent importable in an offline / minimal environment
+    OpenAI = None  # type: ignore[assignment]
+
+load_dotenv()  # reads OPENAI_API_KEY (and optional overrides) from a local .env if present
+
+DEFAULT_LLM_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
@@ -61,7 +72,48 @@ class Agent:
         self._sessions: dict[str, dict] = {} #create dict to remember prev inputs
         self._product_embeddings: np.ndarray | None = None
         self._asin_to_embedding_index: dict[str, int] = {}
+        self.llm = self._init_llm()
         self._build_index()
+
+    def _init_llm(self):
+        """Return an OpenAI client, or None to run fully offline.
+
+        The organizer may disable network access for final scoring, so every
+        LLM call must be optional: check `if self.llm:` before using it.
+        """
+        if os.getenv("AGENT_USE_LLM", "1").lower() in {"0", "false", "no"}:
+            return None
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key or OpenAI is None:
+            return None
+        return OpenAI(api_key=api_key)
+
+    def _llm(self, state: dict, system: str, user: str, max_tokens: int = 200) -> str | None:
+        """Single chat completion; accumulates token usage into the session state.
+
+        Returns None (never raises) when the LLM is unavailable or the call fails,
+        so callers can fall back to the local heuristic path.
+        """
+        if self.llm is None:
+            return None
+        try:
+            response = self.llm.chat.completions.create(
+                model=DEFAULT_LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                max_tokens=max_tokens,
+                temperature=0,
+            )
+        except Exception:
+            return None
+        usage = response.usage
+        if usage is not None:
+            state["usage"]["prompt_tokens"] += int(usage.prompt_tokens or 0)
+            state["usage"]["completion_tokens"] += int(usage.completion_tokens or 0)
+        content = response.choices[0].message.content if response.choices else None
+        return content.strip() if content else None
 
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
@@ -122,6 +174,7 @@ class Agent:
             "base_context": "",
             "override_context": "",
             "asked": set(),
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0},
         }
 
     def _query_text(self, state: dict, user_message: str) -> str:
@@ -235,12 +288,32 @@ class Agent:
         if session_id not in self._sessions:
             raise RuntimeError("reset must be called before respond")
         state = self._sessions[session_id]
+        # Report only the tokens spent on this turn, not the session running total.
+        usage_before = dict(state["usage"])
+
         query_text = self._query_text(state, user_message)
         recommendations = self._rank(query_text, top_k)
         ask_attribute = self._ask_attribute(state, turn, user_message)
+
+        # Example LLM use: a natural customer-facing message. Falls back to a
+        # fixed string when no key is configured or the call fails.
+        message = self._llm(
+            state,
+            system="You are a concise shopping assistant. Reply in one sentence.",
+            user=(
+                f"The customer said: {user_message!r}. "
+                f"You are showing them {len(recommendations)} products"
+                + (f" and want to ask about their {ask_attribute}." if ask_attribute else ".")
+            ),
+            max_tokens=60,
+        ) or "Here are the closest matches I found. I can narrow them further with one more detail."
+
         return {
-            "message": "Here are the closest matches I found. I can narrow them further with one more detail.",
+            "message": message,
             "ask_attribute": ask_attribute,
             "recommendations": recommendations,
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+            "usage": {
+                "prompt_tokens": state["usage"]["prompt_tokens"] - usage_before["prompt_tokens"],
+                "completion_tokens": state["usage"]["completion_tokens"] - usage_before["completion_tokens"],
+            },
         }

@@ -34,11 +34,17 @@ Verify the downloaded file using the published `SHA256SUMS` file.
 
 ## Run the Starter
 
-Python 3.10 or later is recommended. The starter uses only the Python standard library.
+Python 3.10 or later is recommended.
 
 ```bash
+pip install -r requirements.txt
+cp .env.example .env   # then put your OPENAI_API_KEY in .env (never commit it)
 python3 -m evaluator.local_evaluator
 ```
+
+The agent runs fully offline when no `OPENAI_API_KEY` is set (or `AGENT_USE_LLM=0`);
+LLM calls are optional and fall back to local heuristics. Set `OPENAI_MODEL` to override
+the default `gpt-4o-mini`.
 
 Edit `starter/agent.py` to implement your system. Do not edit the evaluator or public labels when reporting your local score.
 The command writes per-session results and aggregate metrics to `results.json`.
