@@ -5,12 +5,8 @@ import re
 import sqlite3
 from pathlib import Path
 
-try:
-    from .semantic_index import SentenceTransformerReranker
-    from .vector_index import HashedVectorizer, cosine_similarity
-except ImportError:  # Allows copying starter/agent.py to a flat submission folder.
-    from semantic_index import SentenceTransformerReranker
-    from vector_index import HashedVectorizer, cosine_similarity
+import numpy as np
+from sentence_transformers import SentenceTransformer
 
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
@@ -61,11 +57,10 @@ class Agent:
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
         self.catalog_path = Path(catalog_path)
         self.connection = sqlite3.connect(":memory:")
-        self.vectorizer = HashedVectorizer(dimensions=1024)
-        self.semantic_reranker = SentenceTransformerReranker()
+        self.embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
         self._sessions: dict[str, dict] = {} #create dict to remember prev inputs
-        self._product_vectors: dict[str, dict[int, float]] = {}
-        self._product_texts: dict[str, str] = {}
+        self._product_embeddings: np.ndarray | None = None
+        self._asin_to_embedding_index: dict[str, int] = {}
         self._build_index()
 
     def _build_index(self) -> None:
@@ -76,13 +71,14 @@ class Agent:
             "tokenize='unicode61 remove_diacritics 2')"
         )
         batch: list[tuple[str, str, str, str, str, str, str]] = []
+        product_asins: list[str] = []
+        product_texts: list[str] = []
         with self.catalog_path.open(encoding="utf-8") as handle:
             for line in handle:
                 product = json.loads(line)
                 parent_asin = str(product["parent_asin"])
-                product_text = _product_text(product)
-                self._product_texts[parent_asin] = product_text
-                self._product_vectors[parent_asin] = self.vectorizer.embed(product_text)
+                product_asins.append(parent_asin)
+                product_texts.append(_product_text(product))
                 batch.append(
                     (
                         parent_asin,
@@ -100,6 +96,17 @@ class Agent:
         if batch:
             cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
         self.connection.commit()
+        self._product_embeddings = self.embedding_model.encode(
+            product_texts,
+            batch_size=128,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        self._asin_to_embedding_index = {
+            parent_asin: index
+            for index, parent_asin in enumerate(product_asins)
+        }
 
     def reset(self, session_id: str, user_profile: dict) -> None: ##starts new shopper conversation
         # The profile is anonymized and may be used for personalization.
@@ -128,7 +135,16 @@ class Agent:
             state["override_context"] = state["base_context"]
             messages.clear()
 
-        messages.append(user_message)
+        no_preference = (
+            "don't have a preference" in lowered
+            or "no preference" in lowered
+            or "use your judgment" in lowered
+        )
+
+        if not no_preference:
+            messages.append(user_message)
+
+        #messages.append(user_message)
         recent_messages = messages[-4:]
 
         query_parts = []
@@ -153,32 +169,48 @@ class Agent:
     def _rank(self, query_text: str, top_k: int) -> list[dict]:
         candidate_limit = max(80, min(300, top_k * 30))
         candidates = self._bm25_candidates(query_text, candidate_limit)
-        if not candidates:
+        if not candidates or self._product_embeddings is None:
             return []
 
-        query_vector = self.vectorizer.embed(query_text)
-        semantic_scores = self.semantic_reranker.score(
+        query_embedding = self.embedding_model.encode(
             query_text,
-            ((asin, self._product_texts.get(asin, "")) for asin, _score in candidates),
+            convert_to_numpy=True,
+            normalize_embeddings=True,
         )
+
         count = max(1, len(candidates) - 1)
         scored: list[tuple[float, str]] = []
+
         for rank, (parent_asin, _bm25_score) in enumerate(candidates):
             bm25_rank_score = 1.0 - (rank / count)
-            vector_score = (cosine_similarity(query_vector, self._product_vectors.get(parent_asin, {})) + 1.0) / 2.0
-            semantic_score = (semantic_scores.get(parent_asin, 0.0) + 1.0) / 2.0
-            if semantic_scores:
-                final_score = 0.45 * bm25_rank_score + 0.15 * vector_score + 0.40 * semantic_score
+
+            embedding_index = self._asin_to_embedding_index.get(parent_asin)
+            if embedding_index is None:
+                semantic_score = 0.0
             else:
-                final_score = 0.62 * bm25_rank_score + 0.38 * vector_score
+                semantic_score = float(
+                    np.dot(
+                        query_embedding,
+                        self._product_embeddings[embedding_index],
+                    )
+                )
+                semantic_score = (semantic_score + 1.0) / 2.0
+
+            final_score = 0.80 * bm25_rank_score + 0.20 * semantic_score
             scored.append((final_score, parent_asin))
+
         scored.sort(reverse=True)
-        return [{"parent_asin": parent_asin, "score": score} for score, parent_asin in scored[:top_k]]
+        return [
+            {"parent_asin": parent_asin, "score": score}
+            for score, parent_asin in scored[:top_k]
+        ]
+
 
     def _ask_attribute(self, state: dict, turn: int, user_message: str) -> str | None:
         lowered = user_message.lower()
         if turn >= 7:
             return None
+
         if "don't have a preference" in lowered or "not quite right" in lowered:
             priority = ["feature", "style", "material", "color", "use_case", "brand", "size", "budget"]
         elif turn <= 2:
