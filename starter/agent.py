@@ -21,6 +21,10 @@ DEFAULT_LLM_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+OVERRIDE_RE = re.compile(
+    r"\b(?:actually|instead|ignore|disregard|change of mind|new requirement|what i need is)\b",
+    re.IGNORECASE,
+)
 STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
     "i", "in", "is", "it", "me", "my", "of", "on", "or", "please", "some",
@@ -72,6 +76,7 @@ class Agent:
         self._sessions: dict[str, dict] = {} #create dict to remember prev inputs
         self._product_embeddings: np.ndarray | None = None
         self._asin_to_embedding_index: dict[str, int] = {}
+        self._asin_to_product_text: dict[str, str] = {}
         self.llm = self._init_llm()
         self._build_index()
 
@@ -148,17 +153,27 @@ class Agent:
         if batch:
             cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
         self.connection.commit()
-        self._product_embeddings = self.embedding_model.encode(
-            product_texts,
-            batch_size=128,
-            show_progress_bar=True,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-        )
+        embedding_cache = self.catalog_path.with_name("catalog.embeddings.npy")
+        if embedding_cache.exists():
+            cached_embeddings = np.load(embedding_cache, mmap_mode="r")
+            if cached_embeddings.shape[0] == len(product_texts):
+                self._product_embeddings = cached_embeddings
+            else:
+                self._product_embeddings = None
+        if self._product_embeddings is None:
+            self._product_embeddings = self.embedding_model.encode(
+                product_texts,
+                batch_size=int(os.getenv("AGENT_EMBED_BATCH_SIZE", "512")),
+                show_progress_bar=True,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+            )
+            np.save(embedding_cache, self._product_embeddings)
         self._asin_to_embedding_index = {
             parent_asin: index
             for index, parent_asin in enumerate(product_asins)
         }
+        self._asin_to_product_text = dict(zip(product_asins, product_texts))
 
     def reset(self, session_id: str, user_profile: dict) -> None: ##starts new shopper conversation
         # The profile is anonymized and may be used for personalization.
@@ -173,9 +188,37 @@ class Agent:
             "messages": [],
             "base_context": "",
             "override_context": "",
+            "override_requirement": "",
+            "override_active": False,
+            "focus_text": "",
             "asked": set(),
             "usage": {"prompt_tokens": 0, "completion_tokens": 0},
         }
+
+    @staticmethod
+    def _is_override(user_message: str) -> bool:
+        """Detect a changed requirement without depending on one exact phrase."""
+        return bool(OVERRIDE_RE.search(user_message))
+
+    @staticmethod
+    def _override_query(user_message: str) -> str:
+        """Remove reset wording while preserving the new requirement."""
+        cleaned = re.sub(
+            r"^\s*(?:actually|instead)?\s*,?\s*"
+            r"(?:ignore|disregard)\s+(?:my|the)\s+(?:earlier|previous)\s+"
+            r"(?:preference|preferences|request|requirements?)\s*[,.:;-]*",
+            "",
+            user_message,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"^\s*actually\s*[,.:;-]*\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"^\s*what\s+i\s+need\s+is\s*[:,-]*\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        return cleaned.strip()
 
     def _query_text(self, state: dict, user_message: str) -> str:
         messages: list[str] = state["messages"]
@@ -184,8 +227,12 @@ class Agent:
         if not state["base_context"]:
             state["base_context"] = user_message.split(".", 1)[0].strip()
 
-        if "ignore" in lowered or "instead" in lowered:
+        if self._is_override(user_message):
+            # Retain the product category, but discard old preferences and
+            # old conversation text after a hard intent change.
+            state["override_active"] = True
             state["override_context"] = state["base_context"]
+            state["override_requirement"] = self._override_query(user_message)
             messages.clear()
 
         no_preference = (
@@ -196,6 +243,7 @@ class Agent:
 
         if not no_preference:
             messages.append(user_message)
+            state["focus_text"] = user_message
 
         #messages.append(user_message)
         recent_messages = messages[-4:]
@@ -219,7 +267,15 @@ class Agent:
         ).fetchall()
         return [(str(parent_asin), float(score)) for parent_asin, score in rows]
 
-    def _rank(self, query_text: str, top_k: int) -> list[dict]:
+    def _rank(
+        self,
+        query_text: str,
+        top_k: int,
+        override_active: bool = False,
+        override_context: str = "",
+        override_requirement: str = "",
+        focus_text: str = "",
+    ) -> list[dict]:
         candidate_limit = max(80, min(300, top_k * 30))
         candidates = self._bm25_candidates(query_text, candidate_limit)
         if not candidates or self._product_embeddings is None:
@@ -233,6 +289,10 @@ class Agent:
 
         count = max(1, len(candidates) - 1)
         scored: list[tuple[float, str]] = []
+        override_terms = set(_terms(override_requirement)) if override_active else set()
+        override_phrase = " ".join(_terms(override_requirement)) if override_active else ""
+        focus_terms = set(_terms(focus_text))
+        focus_phrase = " ".join(_terms(focus_text))
 
         for rank, (parent_asin, _bm25_score) in enumerate(candidates):
             bm25_rank_score = 1.0 - (rank / count)
@@ -250,6 +310,22 @@ class Agent:
                 semantic_score = (semantic_score + 1.0) / 2.0
 
             final_score = 0.80 * bm25_rank_score + 0.20 * semantic_score
+            if override_terms:
+                product_text = self._asin_to_product_text.get(parent_asin, "")
+                product_terms = set(_terms(product_text))
+                overlap = len(override_terms & product_terms) / len(override_terms)
+                # The new requirement is a tie-breaker among recalled
+                # candidates, never a replacement for lexical/semantic rank.
+                final_score += 0.12 * overlap
+                if len(override_terms) > 1 and override_phrase in " ".join(_terms(product_text)):
+                    final_score += 0.10
+            elif focus_terms:
+                product_text = self._asin_to_product_text.get(parent_asin, "")
+                product_terms = set(_terms(product_text))
+                overlap = len(focus_terms & product_terms) / len(focus_terms)
+                final_score += 0.24 * overlap
+                if len(focus_terms) > 1 and focus_phrase in " ".join(_terms(product_text)):
+                    final_score += 0.18
             scored.append((final_score, parent_asin))
 
         scored.sort(reverse=True)
@@ -292,7 +368,14 @@ class Agent:
         usage_before = dict(state["usage"])
 
         query_text = self._query_text(state, user_message)
-        recommendations = self._rank(query_text, top_k)
+        recommendations = self._rank(
+            query_text,
+            top_k,
+            state["override_active"],
+            state["override_context"],
+            state["override_requirement"],
+            state["focus_text"],
+        )
         ask_attribute = self._ask_attribute(state, turn, user_message)
 
         # Example LLM use: a natural customer-facing message. Falls back to a
