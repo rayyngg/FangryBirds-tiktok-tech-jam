@@ -19,7 +19,7 @@ STOPWORDS = {
 }
 
 
-def _text(value: object) -> str:
+def _text(value: object) -> str: ##turns every input into string
     if value is None:
         return ""
     if isinstance(value, dict):
@@ -45,7 +45,7 @@ def _product_text(product: dict) -> str:
     return " ".join(part for part in weighted_parts if part)
 
 
-def _terms(text: str) -> list[str]:
+def _terms(text: str) -> list[str]: #removes useless words
     return [
         token.lower()
         for token in TOKEN_RE.findall(text)
@@ -60,7 +60,7 @@ class Agent:
         self.catalog_path = Path(catalog_path)
         self.connection = sqlite3.connect(":memory:")
         self.vectorizer = HashedVectorizer(dimensions=1024)
-        self._sessions: dict[str, dict] = {}
+        self._sessions: dict[str, dict] = {} #create dict to remember prev inputs
         self._product_vectors: dict[str, dict[int, float]] = {}
         self._build_index()
 
@@ -95,7 +95,7 @@ class Agent:
             cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
         self.connection.commit()
 
-    def reset(self, session_id: str, user_profile: dict) -> None:
+    def reset(self, session_id: str, user_profile: dict) -> None: ##starts new shopper conversation
         # The profile is anonymized and may be used for personalization.
         profile_text = " ".join(
             [
@@ -106,17 +106,31 @@ class Agent:
         self._sessions[session_id] = {
             "profile_text": profile_text,
             "messages": [],
+            "base_context": "",
+            "override_context": "",
             "asked": set(),
         }
 
     def _query_text(self, state: dict, user_message: str) -> str:
         messages: list[str] = state["messages"]
         lowered = user_message.lower()
-        if "actually" in lowered and ("ignore" in lowered or "instead" in lowered):
+
+        if not state["base_context"]:
+            state["base_context"] = user_message.split(".", 1)[0].strip()
+
+        if "ignore" in lowered or "instead" in lowered:
+            state["override_context"] = state["base_context"]
             messages.clear()
+
         messages.append(user_message)
         recent_messages = messages[-4:]
-        return " ".join([*recent_messages, state["profile_text"]]).strip()
+
+        query_parts = []
+        if state["override_context"]:
+            query_parts.append(state["override_context"])
+        query_parts.extend(recent_messages)
+        query_parts.append(state["profile_text"])
+        return " ".join(query_parts).strip()
 
     def _bm25_candidates(self, query_text: str, limit: int) -> list[tuple[str, float]]:
         unique_terms = list(dict.fromkeys(_terms(query_text)))[:60]
