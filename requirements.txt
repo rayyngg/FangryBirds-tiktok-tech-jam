@@ -1,4 +1,8 @@
+# Required for the default (fully offline, lexical + structural) agent: standard library only.
+# These two are small conveniences used by optional paths and kept for a complete dev install.
 numpy
-sentence-transformers
-openai
 python-dotenv
+
+# Optional tiers — install with `pip install -r requirements-optional.txt`:
+#   sentence-transformers  (AGENT_USE_EMBEDDINGS=1, local model via scripts/fetch_model.py)
+#   openai                 (AGENT_USE_LLM=1, customer-facing message phrasing only)
