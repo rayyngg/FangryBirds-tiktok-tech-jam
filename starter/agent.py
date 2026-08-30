@@ -1,402 +1,300 @@
+"""FangryBirds conversational shopping agent.
+
+Per turn: parse the customer message into structured state -> rank a bounded candidate pool ->
+decide how many items to show -> choose the next question -> phrase the reply. All retrieval is
+local (SQLite FTS5 plus in-memory structural indexes built from the frozen catalog); the dense
+sentence-transformer tier and the LLM phrasing are optional, default off, and every failure path
+degrades to a valid response instead of raising.
+
+Environment switches (all optional):
+  AGENT_CATALOG_PATH       catalog location (default <repo>/data/catalog.jsonl)
+  AGENT_USE_BUCKET=1       coarse-category tier (bucket members rank first)
+  AGENT_PARSE_REPLIES=1    structured constraint parsing + exact/substring tiers
+  AGENT_DEMOTE_SHOWN=1     items already shown this session are demoted to the tail
+  AGENT_ASK_POLICY=other   other | value (question-value estimate; ablation only)
+  AGENT_CONFIDENCE_GATE=1  show fewer items while the next reply is expected to pin the target (0 = always 10)
+  AGENT_USE_EMBEDDINGS=0   dense tier from a local model + cached catalog matrix
+  AGENT_W_POP/W_FTS/W_EMBED  blend weights for the popularity / lexical / dense scores
+  AGENT_USE_LLM=0          optional OpenAI phrasing of the customer-facing message
+"""
 from __future__ import annotations
 
-import json
 import os
-import re
-import sqlite3
 from pathlib import Path
 
-import numpy as np
-from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer
+from . import ask_policy, embedder, parsing, retrieval
+from .state import SessionState
+
+try:  # optional: reads OPENAI_API_KEY (and overrides) from a local .env; the default path needs neither
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:  # pragma: no cover - python-dotenv not installed
+    pass
 
 try:
     from openai import OpenAI
-except ImportError:  # keeps the agent importable in an offline / minimal environment
+except ImportError:  # keeps the agent importable in a minimal environment
     OpenAI = None  # type: ignore[assignment]
 
-load_dotenv()  # reads OPENAI_API_KEY (and optional overrides) from a local .env if present
-
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CATALOG_PATH = PACKAGE_ROOT / "data" / "catalog.jsonl"
 DEFAULT_LLM_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+RANK_WEIGHT = 0.30      # MRR weight in the technical score
+TURN_WEIGHT = 0.02      # efficiency weight per turn (0.20 / 10)
+GATE_MAX_TURN = 4
 
 
-TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
-OVERRIDE_RE = re.compile(
-    r"\b(?:actually|instead|ignore|disregard|change of mind|new requirement|what i need is)\b",
-    re.IGNORECASE,
-)
-STOPWORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
-    "i", "in", "is", "it", "me", "my", "of", "on", "or", "please", "some",
-    "that", "the", "this", "to", "want", "with", "would", "you", "looking",
-}
-
-
-def _text(value: object) -> str: ##turns every input into string
-    if value is None:
-        return ""
-    if isinstance(value, dict):
-        return " ".join(f"{key} {item}" for key, item in value.items())
-    if isinstance(value, list):
-        return " ".join(str(item) for item in value)
-    return str(value)
-
-
-def _product_text(product: dict) -> str:
-    weighted_parts = [
-        _text(product.get("title")),
-        _text(product.get("title")),
-        _text(product.get("categories")),
-        _text(product.get("categories")),
-        _text(product.get("features")),
-        _text(product.get("details")),
-        _text(product.get("store")),
-        _text(product.get("description")),
-    ]
-    if product.get("price") not in (None, ""):
-        weighted_parts.append(f"budget price {product['price']}")
-    return " ".join(part for part in weighted_parts if part)
-
-
-def _terms(text: str) -> list[str]:  #removes useless words
-    return [
-        token.lower()
-        for token in TOKEN_RE.findall(text)
-        if len(token) > 1 and token.lower() not in STOPWORDS
-    ]
+def _float(name: str, default: str) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except ValueError:
+        return float(default)
 
 
 class Agent:
-    """Hybrid BM25, local vector, and optional sentence-transformer retrieval."""
+    """Structured-state conversational search over the frozen catalog."""
 
-    def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
-        self.catalog_path = Path(catalog_path)
-        self.connection = sqlite3.connect(":memory:")
-        self.embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-        self._sessions: dict[str, dict] = {} #create dict to remember prev inputs
-        self._product_embeddings: np.ndarray | None = None
-        self._asin_to_embedding_index: dict[str, int] = {}
-        self._asin_to_product_text: dict[str, str] = {}
+    def __init__(self, catalog_path: str | Path | None = None) -> None:
+        self.catalog_path = self._resolve_catalog_path(catalog_path or os.getenv("AGENT_CATALOG_PATH") or DEFAULT_CATALOG_PATH)
+        self.use_bucket = embedder.flag("AGENT_USE_BUCKET", "1")
+        self.parse_replies = embedder.flag("AGENT_PARSE_REPLIES", "1")
+        self.demote_shown = embedder.flag("AGENT_DEMOTE_SHOWN", "1")
+        # Default decided by scripts/perturb_eval.py: the gate scored >= the full-list variant under
+        # every simulator perturbation (results/*-perturb.md). AGENT_CONFIDENCE_GATE=0 restores full lists.
+        self.confidence_gate = embedder.flag("AGENT_CONFIDENCE_GATE", "1")
+        self.ask_mode = os.getenv("AGENT_ASK_POLICY", "other").strip().lower()
+        self.weights = (_float("AGENT_W_POP", "1.0"), _float("AGENT_W_FTS", "0.0"), _float("AGENT_W_EMBED", "0.0"))
+        self.index = retrieval.CatalogIndex(self.catalog_path)
+        self.embedding_model = None
+        self.embeddings = None
+        try:
+            self.embedding_model = embedder.load_embedder()
+            if self.embedding_model is not None:
+                cache = self.catalog_path.with_name("catalog.embeddings.npy")
+                self.embeddings = embedder.load_cached_embeddings(cache, len(self.index.asins))
+                if self.embeddings is None:
+                    self.embedding_model = None  # never encode the catalog at construction
+        except Exception:
+            self.embedding_model = None
+            self.embeddings = None
+        self._row_of = {asin: row for row, asin in enumerate(self.index.asins)}
         self.llm = self._init_llm()
-        self._build_index()
+        self._sessions: dict[str, SessionState] = {}
 
-    def _init_llm(self):
-        """Return an OpenAI client, or None to run fully offline.
+    @staticmethod
+    def _resolve_catalog_path(configured: str | Path) -> Path:
+        """Explicit argument > AGENT_CATALOG_PATH > <repo>/data/catalog.jsonl.
 
-        The organizer may disable network access for final scoring, so every
-        LLM call must be optional: check `if self.llm:` before using it.
+        A relative path that does not exist from the current working directory (e.g. the harness's
+        default ``data/catalog.jsonl`` when run from elsewhere) is retried relative to the repository.
         """
-        if os.getenv("AGENT_USE_LLM", "1").lower() in {"0", "false", "no"}:
+        path = Path(configured)
+        if path.exists() or path.is_absolute():
+            return path
+        candidate = PACKAGE_ROOT / path
+        return candidate if candidate.exists() else path
+
+    # ----------------------------------------------------------------- interface
+    def reset(self, session_id: str, user_profile: dict) -> None:
+        # The anonymised profile carries no information about the target product, so retrieval
+        # ignores it; it is kept only for message phrasing.
+        state = SessionState(str(session_id))
+        state.log.append({"profile": user_profile if isinstance(user_profile, dict) else {}})
+        self._sessions[str(session_id)] = state
+
+    def respond(self, session_id: str, user_message: str, turn: int, top_k: int) -> dict:
+        try:
+            return self._respond(str(session_id), user_message, int(turn), int(top_k))
+        except Exception:
+            return self._fallback(str(session_id), top_k)
+
+    def session_debug(self, session_id: str) -> dict | None:
+        state = self._sessions.get(str(session_id))
+        return state.debug() if state else None
+
+    def bucket_stats(self) -> dict:
+        return self.index.bucket_stats()
+
+    # ---------------------------------------------------------------- pipeline
+    def _respond(self, session_id: str, user_message: str, turn: int, top_k: int) -> dict:
+        state = self._sessions.get(session_id)
+        if state is None:
+            self.reset(session_id, {})
+            state = self._sessions[session_id]
+        state.turn = turn
+        usage_before = dict(state.usage)
+        top_k = max(1, top_k)
+
+        parsed = parsing.parse_message(user_message, state, self.index)
+        if not self.use_bucket:
+            parsed.bucket = None
+        if self.parse_replies or parsed.kind.startswith("opener"):
+            parsing.apply_parsed(state, parsed, self.index)
+        else:
+            state.last_kind, state.last_template_matched, state.last_new_exact_info = parsed.kind, False, False
+            state.free_text.append(str(user_message))
+
+        query_text = self._query_text(state)
+        ranked = retrieval.rank_candidates(
+            self.index, state, query_text, embed_fn=self._embed_fn(query_text), weights=self.weights
+        )
+        candidates = [item.parent_asin for item in ranked]
+        count = self._list_length(state, ranked, turn, top_k)
+        gated = count < top_k          # the gate held items back (as opposed to a small candidate pool)
+        recommendations = candidates[:count]
+
+        attribute = ask_policy.choose_attribute(self.ask_mode, state, self.index, candidates, turn)
+        state.pending_ask = attribute
+        state.asked.append(attribute)
+        if self.demote_shown and state.hits_count:
+            for asin in recommendations:
+                state.shown.setdefault(asin, turn)
+
+        message = self._message(state, attribute, recommendations, user_message, gated)
+        state.log.append({
+            "turn": turn, "kind": parsed.kind, "template": parsed.template_matched, "ask": attribute,
+            "shown": len(recommendations), "top": recommendations[:3],
+        })
+        return {
+            "message": message,
+            "ask_attribute": attribute,
+            "recommendations": [{"parent_asin": asin} for asin in recommendations],
+            "usage": {
+                "prompt_tokens": max(0, state.usage["prompt_tokens"] - usage_before["prompt_tokens"]),
+                "completion_tokens": max(0, state.usage["completion_tokens"] - usage_before["completion_tokens"]),
+            },
+        }
+
+    def _query_text(self, state: SessionState) -> str:
+        parts = [state.bucket or state.category or ""]
+        parts.extend(state.known)
+        parts.extend(state.free_text[-4:])
+        return " ".join(part for part in parts if part).strip()
+
+    def _embed_fn(self, query_text: str):
+        if self.embedding_model is None or self.embeddings is None or self.weights[2] <= 0:
+            return None
+        query = embedder.encode_query(self.embedding_model, query_text)
+        if query is None:
+            return None
+        matrix = self.embeddings
+        row_of = self._row_of
+
+        def score(asins: list[str]) -> dict[str, float]:
+            import numpy as np
+
+            rows = [row_of[asin] for asin in asins if asin in row_of]
+            if not rows:
+                return {}
+            sims = np.asarray(matrix[rows]) @ query
+            return {asin: float((sim + 1.0) / 2.0) for asin, sim in zip([a for a in asins if a in row_of], sims)}
+
+        return score
+
+    def _list_length(self, state: SessionState, ranked: list[retrieval.Scored], turn: int, top_k: int) -> int:
+        """Confidence gate: show only the items whose hit-now value beats deferring one turn.
+
+        A hit at rank r on turn t contributes 0.30/r - 0.02*t (plus the hit constant); deferring one
+        turn and asking "other" is worth 0.30*E[rr_next] - 0.02*(t+1). Rank r is shown when the
+        former is at least the latter. Guarded so that a paraphrased or unparsed message, an
+        exhausted card, a late turn, or a pre-override turn always yields the full list.
+        """
+        if not self.confidence_gate or not ranked:
+            return top_k
+        if (
+            not state.hits_count
+            or state.card_exhausted
+            or turn > GATE_MAX_TURN
+            or not state.last_template_matched
+            or not (turn == 1 or state.last_new_exact_info or state.last_kind == "boundary")
+        ):
+            return top_k
+        candidates = [item.parent_asin for item in ranked if not item.shown]
+        expected = ask_policy.expected_next_reciprocal_rank(self.index, candidates, state.sim_disclosed)
+        deferral = RANK_WEIGHT * expected - TURN_WEIGHT * (turn + 1)
+        count = 0
+        for rank in range(1, top_k + 1):
+            if RANK_WEIGHT / rank - TURN_WEIGHT * turn >= deferral:
+                count = rank
+            else:
+                break
+        return max(1, count)
+
+    def _message(self, state: SessionState, attribute: str, recommendations: list[str], user_message: str, gated: bool = False) -> str:
+        category = state.category or state.bucket or "options"
+        count = len(recommendations)
+        if count == 0:
+            lead = f"I could not find matching {category} yet."
+        elif gated:
+            title = self.index.titles.get(recommendations[0], "this item")[:80]
+            lead = (
+                f"I have a strong candidate for {category} — {title} — and I'm confirming one detail before showing more options."
+                if count == 1
+                else f"I have {count} strong candidates for {category} and I'm confirming one detail before showing more options."
+            )
+        elif count == 1:
+            lead = f"Here is 1 {category} option matching what you told me."
+        else:
+            lead = f"Here are {count} {category} options matching what you told me."
+        question = ask_policy.question_for(attribute)
+        llm_text = self._llm(
+            state,
+            system="You are a concise shopping assistant. Reply in one or two short sentences.",
+            user=(
+                f"The customer said: {user_message!r}. You are showing {len(recommendations)} products "
+                f"for {category!r} and want to ask about their {attribute}. Constraints so far: {state.known!r}."
+            ),
+            max_tokens=80,
+        )
+        return llm_text or f"{lead} {question}"
+
+    def _fallback(self, session_id: str, top_k: int) -> dict:
+        state = self._sessions.get(session_id)
+        try:
+            pool: list[str] = []
+            if state is not None and state.bucket in self.index.bucket_members:
+                pool = [asin for asin in self.index.bucket_members[state.bucket] if asin not in state.shown]
+            pool.extend(asin for asin in self.index.popularity_head if asin not in pool)
+            recommendations = pool[: max(1, int(top_k))]
+        except Exception:
+            recommendations = []
+        return {
+            "message": "Here are some options. " + ask_policy.question_for("other"),
+            "ask_attribute": "other",
+            "recommendations": [{"parent_asin": asin} for asin in recommendations],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+        }
+
+    # --------------------------------------------------------------------- llm
+    def _init_llm(self):
+        """Optional OpenAI client (AGENT_USE_LLM=1 and OPENAI_API_KEY set); None means fully offline."""
+        if not embedder.flag("AGENT_USE_LLM", "0"):
             return None
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key or OpenAI is None:
             return None
-        return OpenAI(api_key=api_key)
+        try:
+            return OpenAI(api_key=api_key)
+        except Exception:
+            return None
 
-    def _llm(self, state: dict, system: str, user: str, max_tokens: int = 200) -> str | None:
-        """Single chat completion; accumulates token usage into the session state.
-
-        Returns None (never raises) when the LLM is unavailable or the call fails,
-        so callers can fall back to the local heuristic path.
-        """
+    def _llm(self, state: SessionState, system: str, user: str, max_tokens: int = 120) -> str | None:
+        """Single chat completion; accumulates token usage into the session. Never raises."""
         if self.llm is None:
             return None
         try:
             response = self.llm.chat.completions.create(
                 model=DEFAULT_LLM_MODEL,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
                 max_tokens=max_tokens,
                 temperature=0,
             )
         except Exception:
             return None
-        usage = response.usage
+        usage = getattr(response, "usage", None)
         if usage is not None:
-            state["usage"]["prompt_tokens"] += int(usage.prompt_tokens or 0)
-            state["usage"]["completion_tokens"] += int(usage.completion_tokens or 0)
-        content = response.choices[0].message.content if response.choices else None
+            state.usage["prompt_tokens"] += int(getattr(usage, "prompt_tokens", 0) or 0)
+            state.usage["completion_tokens"] += int(getattr(usage, "completion_tokens", 0) or 0)
+        content = response.choices[0].message.content if getattr(response, "choices", None) else None
         return content.strip() if content else None
-
-    def _build_index(self) -> None:
-        cursor = self.connection.cursor()
-        cursor.execute(
-            "CREATE VIRTUAL TABLE products USING fts5("
-            "parent_asin UNINDEXED, title, categories, features, details, store, description, "
-            "tokenize='unicode61 remove_diacritics 2')"
-        )
-        batch: list[tuple[str, str, str, str, str, str, str]] = []
-        product_asins: list[str] = []
-        product_texts: list[str] = []
-        with self.catalog_path.open(encoding="utf-8") as handle:
-            for line in handle:
-                product = json.loads(line)
-                parent_asin = str(product["parent_asin"])
-                product_asins.append(parent_asin)
-                product_texts.append(_product_text(product))
-                batch.append(
-                    (
-                        parent_asin,
-                        _text(product.get("title")),
-                        _text(product.get("categories")),
-                        _text(product.get("features")),
-                        _text(product.get("details")),
-                        _text(product.get("store")),
-                        _text(product.get("description")),
-                    )
-                )
-                if len(batch) >= 1000:
-                    cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
-                    batch.clear()
-        if batch:
-            cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
-        self.connection.commit()
-        embedding_cache = self.catalog_path.with_name("catalog.embeddings.npy")
-        if embedding_cache.exists():
-            cached_embeddings = np.load(embedding_cache, mmap_mode="r")
-            if cached_embeddings.shape[0] == len(product_texts):
-                self._product_embeddings = cached_embeddings
-            else:
-                self._product_embeddings = None
-        if self._product_embeddings is None:
-            self._product_embeddings = self.embedding_model.encode(
-                product_texts,
-                batch_size=int(os.getenv("AGENT_EMBED_BATCH_SIZE", "512")),
-                show_progress_bar=True,
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-            )
-            np.save(embedding_cache, self._product_embeddings)
-        self._asin_to_embedding_index = {
-            parent_asin: index
-            for index, parent_asin in enumerate(product_asins)
-        }
-        self._asin_to_product_text = dict(zip(product_asins, product_texts))
-
-    def reset(self, session_id: str, user_profile: dict) -> None: ##starts new shopper conversation
-        # The profile is anonymized and may be used for personalization.
-        profile_text = " ".join(
-            [
-                _text(user_profile.get("summary")),
-                _text(user_profile.get("preference_tags")),
-            ]
-        )
-        self._sessions[session_id] = {
-            "profile_text": profile_text,
-            "messages": [],
-            "base_context": "",
-            "override_context": "",
-            "override_requirement": "",
-            "override_active": False,
-            "focus_text": "",
-            "asked": set(),
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0},
-        }
-
-    @staticmethod
-    def _is_override(user_message: str) -> bool:
-        """Detect a changed requirement without depending on one exact phrase."""
-        return bool(OVERRIDE_RE.search(user_message))
-
-    @staticmethod
-    def _override_query(user_message: str) -> str:
-        """Remove reset wording while preserving the new requirement."""
-        cleaned = re.sub(
-            r"^\s*(?:actually|instead)?\s*,?\s*"
-            r"(?:ignore|disregard)\s+(?:my|the)\s+(?:earlier|previous)\s+"
-            r"(?:preference|preferences|request|requirements?)\s*[,.:;-]*",
-            "",
-            user_message,
-            flags=re.IGNORECASE,
-        )
-        cleaned = re.sub(r"^\s*actually\s*[,.:;-]*\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(
-            r"^\s*what\s+i\s+need\s+is\s*[:,-]*\s*",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-        return cleaned.strip()
-
-    def _query_text(self, state: dict, user_message: str) -> str:
-        messages: list[str] = state["messages"]
-        lowered = user_message.lower()
-
-        if not state["base_context"]:
-            state["base_context"] = user_message.split(".", 1)[0].strip()
-
-        if self._is_override(user_message):
-            # Retain the product category, but discard old preferences and
-            # old conversation text after a hard intent change.
-            state["override_active"] = True
-            state["override_context"] = state["base_context"]
-            state["override_requirement"] = self._override_query(user_message)
-            messages.clear()
-
-        no_preference = (
-            "don't have a preference" in lowered
-            or "no preference" in lowered
-            or "use your judgment" in lowered
-        )
-
-        if not no_preference:
-            messages.append(user_message)
-            state["focus_text"] = user_message
-
-        #messages.append(user_message)
-        recent_messages = messages[-4:]
-
-        query_parts = []
-        if state["override_context"]:
-            query_parts.append(state["override_context"])
-        query_parts.extend(recent_messages)
-        query_parts.append(state["profile_text"])
-        return " ".join(query_parts).strip()
-
-    def _bm25_candidates(self, query_text: str, limit: int) -> list[tuple[str, float]]:
-        unique_terms = list(dict.fromkeys(_terms(query_text)))[:60]
-        expression = " OR ".join(f'"{term}"' for term in unique_terms)
-        if not expression:
-            return []
-        rows = self.connection.execute(
-            "SELECT parent_asin, bm25(products, 0.0, 6.0, 4.0, 2.5, 2.5, 1.5, 1.0) AS score "
-            "FROM products WHERE products MATCH ? ORDER BY score LIMIT ?",
-            (expression, limit),
-        ).fetchall()
-        return [(str(parent_asin), float(score)) for parent_asin, score in rows]
-
-    def _rank(
-        self,
-        query_text: str,
-        top_k: int,
-        override_active: bool = False,
-        override_context: str = "",
-        override_requirement: str = "",
-        focus_text: str = "",
-    ) -> list[dict]:
-        candidate_limit = max(80, min(300, top_k * 30))
-        candidates = self._bm25_candidates(query_text, candidate_limit)
-        if not candidates or self._product_embeddings is None:
-            return []
-
-        query_embedding = self.embedding_model.encode(
-            query_text,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-        )
-
-        count = max(1, len(candidates) - 1)
-        scored: list[tuple[float, str]] = []
-        override_terms = set(_terms(override_requirement)) if override_active else set()
-        override_phrase = " ".join(_terms(override_requirement)) if override_active else ""
-        focus_terms = set(_terms(focus_text))
-        focus_phrase = " ".join(_terms(focus_text))
-
-        for rank, (parent_asin, _bm25_score) in enumerate(candidates):
-            bm25_rank_score = 1.0 - (rank / count)
-
-            embedding_index = self._asin_to_embedding_index.get(parent_asin)
-            if embedding_index is None:
-                semantic_score = 0.0
-            else:
-                semantic_score = float(
-                    np.dot(
-                        query_embedding,
-                        self._product_embeddings[embedding_index],
-                    )
-                )
-                semantic_score = (semantic_score + 1.0) / 2.0
-
-            final_score = 0.80 * bm25_rank_score + 0.20 * semantic_score
-            if override_terms:
-                product_text = self._asin_to_product_text.get(parent_asin, "")
-                product_terms = set(_terms(product_text))
-                overlap = len(override_terms & product_terms) / len(override_terms)
-                # The new requirement is a tie-breaker among recalled
-                # candidates, never a replacement for lexical/semantic rank.
-                final_score += 0.12 * overlap
-                if len(override_terms) > 1 and override_phrase in " ".join(_terms(product_text)):
-                    final_score += 0.10
-            elif focus_terms:
-                product_text = self._asin_to_product_text.get(parent_asin, "")
-                product_terms = set(_terms(product_text))
-                overlap = len(focus_terms & product_terms) / len(focus_terms)
-                final_score += 0.24 * overlap
-                if len(focus_terms) > 1 and focus_phrase in " ".join(_terms(product_text)):
-                    final_score += 0.18
-            scored.append((final_score, parent_asin))
-
-        scored.sort(reverse=True)
-        return [
-            {"parent_asin": parent_asin, "score": score}
-            for score, parent_asin in scored[:top_k]
-        ]
-
-
-    def _ask_attribute(self, state: dict, turn: int, user_message: str) -> str | None:
-        lowered = user_message.lower()
-        if turn >= 7:
-            return None
-
-        if "don't have a preference" in lowered or "not quite right" in lowered:
-            priority = ["feature", "style", "material", "color", "use_case", "brand", "size", "budget"]
-        elif turn <= 2:
-            priority = ["feature", "material", "style", "color", "use_case", "brand", "size", "budget"]
-        else:
-            priority = ["material", "style", "feature", "color", "use_case", "brand", "size", "budget"]
-
-        asked: set[str] = state["asked"]
-        for attribute in priority:
-            if attribute not in asked:
-                asked.add(attribute)
-                return attribute
-        return None
-
-    def respond(
-        self,
-        session_id: str,
-        user_message: str,
-        turn: int,
-        top_k: int,
-    ) -> dict:
-        if session_id not in self._sessions:
-            raise RuntimeError("reset must be called before respond")
-        state = self._sessions[session_id]
-        # Report only the tokens spent on this turn, not the session running total.
-        usage_before = dict(state["usage"])
-
-        query_text = self._query_text(state, user_message)
-        recommendations = self._rank(
-            query_text,
-            top_k,
-            state["override_active"],
-            state["override_context"],
-            state["override_requirement"],
-            state["focus_text"],
-        )
-        ask_attribute = self._ask_attribute(state, turn, user_message)
-
-        # Example LLM use: a natural customer-facing message. Falls back to a
-        # fixed string when no key is configured or the call fails.
-        message = self._llm(
-            state,
-            system="You are a concise shopping assistant. Reply in one sentence.",
-            user=(
-                f"The customer said: {user_message!r}. "
-                f"You are showing them {len(recommendations)} products"
-                + (f" and want to ask about their {ask_attribute}." if ask_attribute else ".")
-            ),
-            max_tokens=60,
-        ) or "Here are the closest matches I found. I can narrow them further with one more detail."
-
-        return {
-            "message": message,
-            "ask_attribute": ask_attribute,
-            "recommendations": recommendations,
-            "usage": {
-                "prompt_tokens": state["usage"]["prompt_tokens"] - usage_before["prompt_tokens"],
-                "completion_tokens": state["usage"]["completion_tokens"] - usage_before["completion_tokens"],
-            },
-        }

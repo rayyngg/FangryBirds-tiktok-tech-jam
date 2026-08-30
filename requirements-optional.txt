@@ -1,0 +1,3 @@
+# Optional tiers; the agent runs and scores identically without them (see README "Offline mode").
+sentence-transformers
+openai
