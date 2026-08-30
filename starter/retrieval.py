@@ -9,15 +9,21 @@
 * inverted indexes: bucket -> members and exact constraint string -> products, both popularity-sorted.
 
 ``rank_candidates`` scores a bounded candidate pool (bucket members, exact-index postings, FTS hits
-and the popularity head — never the whole catalog) with a lexicographic key: unseen first, bucket
-first, then exact card matches, reply consistency, substring matches, budget window, and finally a
-blended popularity / lexical / semantic score. Tiers, never filters: the list is never empty and a
-mis-parsed bucket or constraint only demotes the target instead of hiding it.
+and the popularity head — never the whole catalog) with a lexicographic key: bucket first, then
+exact card matches, reply consistency, substring matches, budget window, then *unseen before seen*
+(so paging happens among equally supported candidates and a product from another bucket can never
+outrank an in-bucket match just because the latter was shown), and finally a blended popularity /
+lexical / semantic score. Tiers, never filters: the list is never empty and a mis-parsed bucket or
+constraint only demotes the target instead of hiding it.
+
+Set ``AGENT_DISABLE_FTS=1`` (or run on an SQLite without FTS5) to use the pure-Python token index
+instead of FTS5; ranking quality is unchanged because the lexical tier only feeds the candidate pool.
 """
 from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import sqlite3
 from collections import defaultdict
@@ -117,15 +123,18 @@ class CatalogIndex:
     # ------------------------------------------------------------------ build
     def _build(self) -> None:
         cursor = self.connection.cursor()
-        try:
-            cursor.execute(
-                "CREATE VIRTUAL TABLE products USING fts5("
-                "parent_asin UNINDEXED, title, categories, features, details, store, description, "
-                "tokenize='unicode61 remove_diacritics 2')"
-            )
-            self.fts_available = True
-        except sqlite3.OperationalError:
-            self.fts_available = False
+        self.fts_available = False
+        if os.getenv("AGENT_DISABLE_FTS", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+            try:
+                cursor.execute(
+                    "CREATE VIRTUAL TABLE products USING fts5("
+                    "parent_asin UNINDEXED, title, categories, features, details, store, description, "
+                    "tokenize='unicode61 remove_diacritics 2')"
+                )
+                self.fts_available = True
+            except sqlite3.OperationalError:
+                self.fts_available = False
+        if not self.fts_available:
             self._token_index = defaultdict(set)
 
         bucket_members: dict[str, list[str]] = defaultdict(list)
@@ -176,7 +185,9 @@ class CatalogIndex:
                         cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
                         batch.clear()
                 else:
-                    for token in set(TOKEN_RE.findall(" ".join(row[1:]).lower())):
+                    # token fallback: title, categories, features, details, store (descriptions are
+                    # skipped to keep the index small; they carry the least weight in the FTS tier)
+                    for token in set(TOKEN_RE.findall(" ".join(row[1:6]).lower())):
                         self._token_index[token].add(asin)  # type: ignore[index]
         if batch:
             cursor.executemany("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?, ?)", batch)
@@ -245,12 +256,17 @@ class CatalogIndex:
         if not unique_terms:
             return []
         if not self.fts_available:
-            counts: dict[str, int] = defaultdict(int)
-            for term in unique_terms:
-                for asin in self._token_index.get(term, ()):  # type: ignore[union-attr]
-                    counts[asin] += 1
+            # idf-weighted match over the rarest query terms (bounded work: at most 12 posting lists)
+            postings = [(term, self._token_index.get(term)) for term in unique_terms]  # type: ignore[union-attr]
+            postings = sorted(((term, members) for term, members in postings if members), key=lambda item: len(item[1]))
+            total = max(1, len(self.asins))
+            counts: dict[str, float] = defaultdict(float)
+            for _term, members in postings[:12]:
+                idf = math.log(total / len(members)) + 1.0
+                for asin in members:
+                    counts[asin] += idf
             ranked = sorted(counts.items(), key=lambda item: (-item[1], -self.popularity[item[0]], item[0]))[:limit]
-            return [(asin, -float(count)) for asin, count in ranked]
+            return [(asin, -score) for asin, score in ranked]
         expression = " OR ".join(f'"{term}"' for term in unique_terms)
         weights = ", ".join(str(weight) for weight in BM25_WEIGHTS)
         try:
@@ -384,12 +400,12 @@ def rank_candidates(
         is_shown = asin in shown
         in_bucket = bucket is not None and bucket_of[asin] == bucket
         key = (
-            0 if is_shown else 1,
             1 if in_bucket else 0,
             exact,
             consistency(index, asin, events) if events else 0,
             substring,
             budget_ok,
+            0 if is_shown else 1,   # paging: among equally supported candidates, unseen ones come first
             blended,
         )
         scored.append(Scored(asin, key, exact, in_bucket, is_shown))

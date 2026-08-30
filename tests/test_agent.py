@@ -158,9 +158,11 @@ class StateMirrorTest(AgentTestBase):
         message = ev.initial_message(effective, ev.coarse_category(self.categories[target]), disclosed)
         session_id = self.new_session(scenario)
         state = self.state(session_id)
+        self.snapshots = []   # (turn, customer message, agent mirror, evaluator set) after every message
         for turn in range(1, turns + 1):
             response = self.agent.respond(session_id, message, turn, 10)
             self.assertEqual(state.sim_disclosed, disclosed, f"{scenario} turn {turn}")
+            self.snapshots.append((turn, message, set(state.sim_disclosed), set(disclosed)))
             override = behavior.get("override") or {}
             if not override_applied and turn + 1 == int(override.get("turn", 3)):
                 override_applied = True
@@ -175,6 +177,21 @@ class StateMirrorTest(AgentTestBase):
             state, card = self.drive(scenario, target)
             expected = set(card["hard_constraints"]) | set(card["soft_preferences"])
             self.assertEqual(set(state.known), expected, scenario)
+
+    def test_override_opener_constraint_is_re_revealed(self) -> None:
+        """The override opener names soft[-1] without disclosing it; a later 'other' reply repeats it."""
+        state, card = self.drive("intent_override", "D1", turns=6)
+        opener_constraint = card["soft_preferences"][-1]
+        turn1_message, mirror_after_turn1, evaluator_after_turn1 = self.snapshots[0][1], self.snapshots[0][2], self.snapshots[0][3]
+        self.assertTrue(turn1_message.endswith(opener_constraint))          # named in the opener ...
+        self.assertNotIn(opener_constraint, evaluator_after_turn1)         # ... but not disclosed by the simulator
+        self.assertNotIn(opener_constraint, mirror_after_turn1)            # ... and the mirror agrees
+        self.assertIn(opener_constraint, state.known)                      # the agent still uses it for ranking
+        re_reveal = [snap for snap in self.snapshots if snap[1].startswith("For that") and opener_constraint in snap[1]]
+        self.assertTrue(re_reveal, "the opener constraint was never re-revealed")
+        turn, _message, mirror, evaluator_set = re_reveal[0]
+        self.assertIn(opener_constraint, evaluator_set)
+        self.assertEqual(mirror, evaluator_set, f"mirror diverged at turn {turn}")
 
     def test_override_keeps_old_constraint_and_resets_shown(self) -> None:
         state, card = self.drive("intent_override", "D1")
@@ -240,27 +257,36 @@ class RespondContractTest(AgentTestBase):
 
     def test_shown_items_are_demoted_until_override(self) -> None:
         session_id = self.new_session()
-        first = [item["parent_asin"] for item in self.agent.respond(session_id, "I'm looking for Shoes Boots, but I'm still exploring.", 1, 2)["recommendations"]]
-        second = [item["parent_asin"] for item in self.agent.respond(session_id, "I don't have an additional preference for other.", 2, 2)["recommendations"]]
-        self.assertFalse(set(first) & set(second))
-        self.agent.respond(session_id, "Actually, ignore my earlier preference. What I need is: Rubber sole.", 3, 2)
+        first = [item["parent_asin"] for item in self.agent.respond(session_id, "I'm looking for Shoes Boots, but I'm still exploring.", 1, 1)["recommendations"]]
+        second = [item["parent_asin"] for item in self.agent.respond(session_id, "I don't have an additional preference for other.", 2, 1)["recommendations"]]
+        # paging: the next unseen product of the same bucket comes next (B3 -> B1 by popularity)
+        self.assertEqual((first, second), (["B3"], ["B1"]))
+        third = [item["parent_asin"] for item in self.agent.respond(session_id, "I don't have an additional preference for other.", 3, 2)["recommendations"]]
+        self.assertEqual(third[0], "B2")                                   # last unseen in-bucket product first
+        self.assertEqual(self.agent.index.bucket_of[third[1]], "Shoes Boots")   # then a seen in-bucket one, not another bucket
+        self.agent.respond(session_id, "Actually, ignore my earlier preference. What I need is: Rubber sole.", 4, 2)
         self.assertEqual(set(self.state(session_id).shown), set(self.state(session_id).shown) & set(self.catalog_ids))
-        self.assertTrue(all(turn >= 3 for turn in self.state(session_id).shown.values()))
+        self.assertTrue(all(turn >= 4 for turn in self.state(session_id).shown.values()))   # reset by the override
 
     def test_bucket_and_exact_matching_rank_target_first(self) -> None:
         session_id = self.new_session()
         response = self.agent.respond(session_id, "I'm looking for Jewelry Necklaces. A key requirement is: Material:alloy.", 1, 10)
         self.assertEqual(response["recommendations"][0]["parent_asin"], "N1")
         session_id = self.new_session()
-        # top_k=1 on turn 1 so the tiny bucket is not entirely "shown" (which would demote it on turn 2)
-        first = self.agent.respond(session_id, "I'm looking for Dresses Casual, but I'm still exploring.", 1, 1)
+        first = self.agent.respond(session_id, "I'm looking for Dresses Casual, but I'm still exploring.", 1, 10)
         self.assertEqual(first["recommendations"][0]["parent_asin"], "D1")   # most popular dress
-        response = self.agent.respond(session_id, "For that, what matters is: 100% Acrylic; Pull On closure.", 2, 10)
-        self.assertEqual(response["recommendations"][0]["parent_asin"], "D5")
+        # Every dress was shown on turn 1. In-bucket matches must still outrank unseen products from
+        # other buckets: D1 and D5 each match one constraint, popularity breaks the tie.
+        response = self.agent.respond(session_id, "For that, what matters is: polyester; 100% Acrylic.", 2, 10)
+        top = [item["parent_asin"] for item in response["recommendations"]]
+        self.assertEqual(top[:2], ["D1", "D5"])
+        self.assertTrue(all(self.agent.index.bucket_of[asin] == "Dresses Casual" for asin in top[:5]))
+        response = self.agent.respond(session_id, "For that, what matters is: 100% Acrylic; Pull On closure.", 3, 10)
+        self.assertEqual(response["recommendations"][0]["parent_asin"], "D5")   # now the only product with three matches
 
     def test_budget_constraint_prefers_price_window(self) -> None:
         session_id = self.new_session()
-        self.agent.respond(session_id, "I'm looking for Jewelry Necklaces, but I'm still exploring.", 1, 1)
+        self.agent.respond(session_id, "I'm looking for Jewelry Necklaces, but I'm still exploring.", 1, 10)
         response = self.agent.respond(session_id, "For that, what matters is: Handmade; budget around $19.99.", 2, 10)
         self.assertEqual(response["recommendations"][0]["parent_asin"], "N3")
         self.assertEqual(self.state(session_id).budget, (19.99 * 0.95, 19.99 * 1.05))

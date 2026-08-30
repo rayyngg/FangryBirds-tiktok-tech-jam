@@ -56,7 +56,7 @@ class Agent:
     """Structured-state conversational search over the frozen catalog."""
 
     def __init__(self, catalog_path: str | Path | None = None) -> None:
-        self.catalog_path = Path(catalog_path or os.getenv("AGENT_CATALOG_PATH") or DEFAULT_CATALOG_PATH)
+        self.catalog_path = self._resolve_catalog_path(catalog_path or os.getenv("AGENT_CATALOG_PATH") or DEFAULT_CATALOG_PATH)
         self.use_bucket = embedder.flag("AGENT_USE_BUCKET", "1")
         self.parse_replies = embedder.flag("AGENT_PARSE_REPLIES", "1")
         self.demote_shown = embedder.flag("AGENT_DEMOTE_SHOWN", "1")
@@ -81,6 +81,19 @@ class Agent:
         self._row_of = {asin: row for row, asin in enumerate(self.index.asins)}
         self.llm = self._init_llm()
         self._sessions: dict[str, SessionState] = {}
+
+    @staticmethod
+    def _resolve_catalog_path(configured: str | Path) -> Path:
+        """Explicit argument > AGENT_CATALOG_PATH > <repo>/data/catalog.jsonl.
+
+        A relative path that does not exist from the current working directory (e.g. the harness's
+        default ``data/catalog.jsonl`` when run from elsewhere) is retried relative to the repository.
+        """
+        path = Path(configured)
+        if path.exists() or path.is_absolute():
+            return path
+        candidate = PACKAGE_ROOT / path
+        return candidate if candidate.exists() else path
 
     # ----------------------------------------------------------------- interface
     def reset(self, session_id: str, user_profile: dict) -> None:
@@ -128,6 +141,7 @@ class Agent:
         )
         candidates = [item.parent_asin for item in ranked]
         count = self._list_length(state, ranked, turn, top_k)
+        gated = count < top_k          # the gate held items back (as opposed to a small candidate pool)
         recommendations = candidates[:count]
 
         attribute = ask_policy.choose_attribute(self.ask_mode, state, self.index, candidates, turn)
@@ -137,7 +151,7 @@ class Agent:
             for asin in recommendations:
                 state.shown.setdefault(asin, turn)
 
-        message = self._message(state, attribute, recommendations, user_message)
+        message = self._message(state, attribute, recommendations, user_message, gated)
         state.log.append({
             "turn": turn, "kind": parsed.kind, "template": parsed.template_matched, "ask": attribute,
             "shown": len(recommendations), "top": recommendations[:3],
@@ -207,14 +221,22 @@ class Agent:
                 break
         return max(1, count)
 
-    def _message(self, state: SessionState, attribute: str, recommendations: list[str], user_message: str) -> str:
+    def _message(self, state: SessionState, attribute: str, recommendations: list[str], user_message: str, gated: bool = False) -> str:
         category = state.category or state.bucket or "options"
-        if not recommendations:
+        count = len(recommendations)
+        if count == 0:
             lead = f"I could not find matching {category} yet."
-        elif len(recommendations) == 1:
-            lead = f"My best {category} pick so far is {self.index.titles.get(recommendations[0], 'this item')[:80]}."
+        elif gated:
+            title = self.index.titles.get(recommendations[0], "this item")[:80]
+            lead = (
+                f"I have a strong candidate for {category} — {title} — and I'm confirming one detail before showing more options."
+                if count == 1
+                else f"I have {count} strong candidates for {category} and I'm confirming one detail before showing more options."
+            )
+        elif count == 1:
+            lead = f"Here is 1 {category} option matching what you told me."
         else:
-            lead = f"Here are {len(recommendations)} {category} options matching what you told me."
+            lead = f"Here are {count} {category} options matching what you told me."
         question = ask_policy.question_for(attribute)
         llm_text = self._llm(
             state,

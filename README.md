@@ -10,8 +10,9 @@ The organizer's weak baseline is 0.107 and our previous submission tag `Technica
 
 ## Quick start
 
-Python 3.10+ (developed and measured on 3.12.5). Everything below is CPU-only and needs no network
-once the catalog is present.
+Python 3.9+ (the organizer recommends 3.10+; the code compiles and the unit tests pass on 3.9.6 and
+3.12.5, all measurements below are from 3.12.5). Everything is CPU-only and needs no network once the
+catalog is present.
 
 ```bash
 pip install -r requirements.txt                 # numpy + python-dotenv (both optional at runtime)
@@ -20,7 +21,9 @@ python3 -m evaluator.local_evaluator            # official harness, writes resul
 ```
 
 Instrumented runs (per-scenario / per-difficulty tables, miss log, latency, git metadata) go to
-`results/<short-sha>-<label>.json`:
+`results/<short-sha>-<label>.json`; the wrapper inserts `-dirty-` after the sha when the tree had
+uncommitted changes, so `results/72bd980-dirty-*` are the step-by-step history produced before those
+steps were committed (kept as evidence) and `results/697ff18-*` are the current headline runs:
 
 ```bash
 AGENT_USE_LLM=0 python3 scripts/run_eval.py --label my-run
@@ -44,12 +47,19 @@ Python standard library (SQLite FTS5 + in-memory indexes built from `data/catalo
 
 Neither tier changes the score on the public set (dense: −0.001; LLM: 0 by construction), which is why
 both are disabled. Construction (`Agent.__init__`) and `reset` never raise, `respond` catches every
-internal error and still returns a valid dict, and the agent never writes to disk.
+internal error and still returns a valid dict (bucket or global popularity list, ask `other`), and the
+agent never writes to disk. If the host's SQLite lacks FTS5 (or `AGENT_DISABLE_FTS=1`), a pure-Python
+token index replaces it: identical scores (0.9791 / 0.9140), p95 latency ≈ 50 ms
+(`results/*-nofts-*.json`). The catalog path is the harness's argument, else `AGENT_CATALOG_PATH`, else
+`<repo>/data/catalog.jsonl`; a relative path that does not exist from the current working directory is
+retried relative to the repository, so the harness can run from any directory.
 
-Verified: a clean copy of the tree (no `.git`, no catalog cache, empty `HF_HOME`, `HF_HUB_OFFLINE=1
-TRANSFORMERS_OFFLINE=1`) scores 0.9791 through `python3 -m evaluator.local_evaluator`, and the same
-copy with `AGENT_USE_EMBEDDINGS=1` (model unavailable) degrades to the identical score with no download
-attempted (`HF_HOME` stays empty) — `results/*-offline-clean-copy.json`.
+Verified: a real `git clone` of this branch into a fresh virtualenv with only `requirements.txt`
+installed (no `sentence-transformers`, no `openai`, no `.env`, no `OPENAI_API_KEY`, empty `HF_HOME`,
+`HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`) scores 0.9791 through `python -m evaluator.local_evaluator`
+and passes `python -m unittest`; the same clone with `AGENT_USE_EMBEDDINGS=1` or `AGENT_USE_LLM=1`
+degrades at construction (no exception, same score, `HF_HOME` stays empty) —
+`results/697ff18-offline-clean-clone.json`.
 
 ## How it works
 
@@ -71,13 +81,17 @@ Per turn (`starter/agent.py`):
    constraint pieces, and free text for the lexical tiers.
 2. **Rank** (`starter/retrieval.py`) a bounded candidate pool — bucket members ∪ exact-index postings of
    the known constraints ∪ FTS5 hits ∪ the 300 most popular products, never a full catalog scan — by a
-   lexicographic key: *not yet shown* › *in the opener's bucket* › *number of constraints found in the
-   product's own card* (`starter/cardspec.py` reproduces `intent_card` for every product; parity is
-   unit-tested on all 50,000) › *reply-consistency tie-break* › *case-insensitive substring matches in
-   title/features/details* › *price inside a stated budget window (±5 %)* › *popularity
-   `log1p(rating_number)`*. Tiers, never filters: the list is never short, and a mis-parsed bucket or
-   constraint demotes the target instead of hiding it.
-3. **Show** the top 10 (or, with the confidence gate, fewer — see below).
+   lexicographic key: *in the opener's bucket* › *number of constraints found in the product's own
+   card* (`starter/cardspec.py` reproduces `intent_card` for every product; parity is unit-tested on
+   all 50,000) › *reply-consistency tie-break* › *case-insensitive substring matches in
+   title/features/details* › *price inside a stated budget window (±5 %)* › *not yet shown this
+   session* (paging among equally supported candidates; a product from another bucket never outranks
+   an in-bucket match just because the latter was shown) › *popularity `log1p(rating_number)`*.
+   Tiers, never filters: the list is never short, and a mis-parsed bucket or constraint demotes the
+   target instead of hiding it.
+3. **Show** the top 10 (or, with the confidence gate, fewer — see below). The message states the
+   actual count; when the gate holds items back it says the agent has a strong candidate and is
+   confirming one detail before showing more.
 4. **Ask** (`starter/ask_policy.py`): `other` every turn, never `null` (a null ask yields a
    zero-information reply), also after "no preference" replies and through the last turn. The
    question-value estimator (expected next-turn reciprocal rank under the reveal rule with a
@@ -112,10 +126,14 @@ top-10 lists on every turn (0.914).
 | tag `Technical-0.67` reproduced (old agent, embeddings on) | `420d011-baseline` | 0.672 | 0.795 | 0.462 | 4.19 |
 | 1b offline-safe construction (old ranking, embeddings off) | `61a30f7-step1b-offline-safe` | 0.660 | 0.780 | 0.454 | 4.33 |
 | 2 ask policy: `other` every turn, never null | `72bd980-step2-ask-policy` | 0.696 | 0.800 | 0.515 | 3.94 |
-| 3 coarse-category tier + popularity prior | `*-step3-category-filter` | 0.792 | 0.870 | 0.636 | 2.69 |
-| 4 constraint parser + exact/substring tiers | `*-step4-constraints` | 0.911 | 1.000 | 0.740 | 1.53 |
-| 5 override handling + shown demotion, full lists (`AGENT_CONFIDENCE_GATE=0`) | `*-final-default` | **0.914** | 1.000 | 0.749 | 1.53 |
-| 8 confidence gate (**default**) | `*-final-gate-on` | **0.979** | 1.000 | 0.995 | 1.97 |
+| 3 coarse-category tier + popularity prior | `72bd980-dirty-step3-category-filter` | 0.792 | 0.870 | 0.636 | 2.69 |
+| 4 constraint parser + exact/substring tiers | `72bd980-dirty-step4-constraints` | 0.911 | 1.000 | 0.740 | 1.53 |
+| 5 override handling + shown demotion, full lists (`AGENT_CONFIDENCE_GATE=0`) | `697ff18-dirty-final-default` | **0.914** | 1.000 | 0.749 | 1.53 |
+| 8 confidence gate (**default**) | `697ff18-dirty-final-gate-on`, `697ff18-offline-clean-clone` | **0.979** | 1.000 | 0.995 | 1.97 |
+
+(`697ff18-dirty-*` were produced on top of commit 697ff18 with the ranker key-order fix and message
+change of the verification pass uncommitted; `scripts/regenerate_results.sh` re-creates them with a
+clean sha after committing. Scores are identical before and after that fix.)
 
 Per scenario (HR / MRR / MTTC, full lists → gate): buying 1.000 / 0.771 / 1.09 → 1.000 / 1.000 / 1.48;
 browsing 1.000 / 0.674 / 1.21 → 1.000 / 1.000 / 1.79; intent override 1.000 / 0.967 / 3.60 (both; the
@@ -139,20 +157,20 @@ the private set could differ: different card generation, paraphrased templates, 
 | perturbation of the simulator | full lists — score (HR / MRR / MTTC) | gate — score (HR / MRR / MTTC) |
 |---|---|---|
 | none (public rules) | 0.9140 (1.000 / 0.749 / 1.53) | **0.9791** (1.000 / 0.995 / 1.97) |
-| cards without the material / colour insertion | 0.9272 (1.000 / 0.792 / 1.52) | 0.9669 (0.995 / 0.959 / 1.92) |
+| cards without the material / colour insertion | 0.9268 (1.000 / 0.791 / 1.52) | 0.9640 (0.995 / 0.950 / 1.92) |
 | constraints truncated at 120 instead of 180 chars | 0.9140 (1.000 / 0.749 / 1.53) | 0.9791 (1.000 / 0.995 / 1.97) |
 | hard and soft constraints swapped | 0.9114 (1.000 / 0.743 / 1.57) | 0.9772 (1.000 / 0.993 / 2.02) |
-| all constraint strings lower-cased | 0.9025 (1.000 / 0.710 / 1.53) | 0.9656 (1.000 / 0.954 / 2.04) |
-| reveal template paraphrased ("What I care about most is …") | 0.9054 (1.000 / 0.721 / 1.54) | 0.9462 (1.000 / 0.881 / 1.91) |
+| all constraint strings lower-cased | 0.9034 (1.000 / 0.714 / 1.53) | 0.9627 (1.000 / 0.945 / 2.04) |
+| reveal template paraphrased ("What I care about most is …") | 0.9053 (1.000 / 0.720 / 1.54) | 0.9462 (1.000 / 0.881 / 1.91) |
 | opener paraphrased ("Hi! I want to buy X. It must have: …") | 0.9121 (1.000 / 0.742 / 1.53) | 0.9173 (1.000 / 0.762 / 1.56) |
 | override message paraphrased ("Forget what I said before …") | 0.9140 (1.000 / 0.749 / 1.53) | 0.9791 (1.000 / 0.995 / 1.97) |
 | override turn moved to 2–6 | 0.9128 (1.000 / 0.747 / 1.57) | 0.9795 (1.000 / 1.000 / 2.02) |
-| opener + reveal + override all paraphrased | 0.9044 (1.000 / 0.717 / 1.54) | 0.9056 (1.000 / 0.722 / 1.54) |
+| opener + reveal + override all paraphrased | 0.9043 (1.000 / 0.717 / 1.54) | 0.9055 (1.000 / 0.721 / 1.54) |
 
 Hit Rate stays at 1.000 in every row but one (the gate loses a single override session when cards
 are generated without the material/colour insertion), and the gate never scores below the full-list
 variant — the reason it is the default. Paraphrasing costs MRR, not hits: the exact tiers stop firing
-and the substring / popularity tiers carry the session. Source: `results/*-perturb.json` / `.md`.
+and the substring / popularity tiers carry the session. Source: `results/697ff18-dirty-perturb.json` / `.md`.
 
 ## Latency, tokens and cost
 
