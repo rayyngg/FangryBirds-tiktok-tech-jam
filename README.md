@@ -23,7 +23,7 @@ python3 -m evaluator.local_evaluator            # official harness, writes resul
 Instrumented runs (per-scenario / per-difficulty tables, miss log, latency, git metadata) go to
 `results/<short-sha>-<label>.json`; the wrapper inserts `-dirty-` after the sha when the tree had
 uncommitted changes, so `results/72bd980-dirty-*` are the step-by-step history produced before those
-steps were committed (kept as evidence) and `results/697ff18-*` are the current headline runs:
+steps were committed (kept as evidence) and `results/64220b8-*` are the current headline runs:
 
 ```bash
 AGENT_USE_LLM=0 python3 scripts/run_eval.py --label my-run
@@ -59,7 +59,8 @@ installed (no `sentence-transformers`, no `openai`, no `.env`, no `OPENAI_API_KE
 `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`) scores 0.9791 through `python -m evaluator.local_evaluator`
 and passes `python -m unittest`; the same clone with `AGENT_USE_EMBEDDINGS=1` or `AGENT_USE_LLM=1`
 degrades at construction (no exception, same score, `HF_HOME` stays empty) —
-`results/697ff18-offline-clean-clone.json`.
+`results/64220b8-offline-clean-clone.json` (`scripts/regenerate_results.sh` repeats this run for the
+current commit).
 
 ## How it works
 
@@ -128,12 +129,11 @@ top-10 lists on every turn (0.914).
 | 2 ask policy: `other` every turn, never null | `72bd980-step2-ask-policy` | 0.696 | 0.800 | 0.515 | 3.94 |
 | 3 coarse-category tier + popularity prior | `72bd980-dirty-step3-category-filter` | 0.792 | 0.870 | 0.636 | 2.69 |
 | 4 constraint parser + exact/substring tiers | `72bd980-dirty-step4-constraints` | 0.911 | 1.000 | 0.740 | 1.53 |
-| 5 override handling + shown demotion, full lists (`AGENT_CONFIDENCE_GATE=0`) | `697ff18-dirty-final-default` | **0.914** | 1.000 | 0.749 | 1.53 |
-| 8 confidence gate (**default**) | `697ff18-dirty-final-gate-on`, `697ff18-offline-clean-clone` | **0.979** | 1.000 | 0.995 | 1.97 |
+| 5 override handling + shown demotion, full lists (`AGENT_CONFIDENCE_GATE=0`) | `64220b8-final-default` | **0.914** | 1.000 | 0.749 | 1.53 |
+| 8 confidence gate (**default**) | `64220b8-final-gate-on`, `64220b8-offline-clean-clone` | **0.979** | 1.000 | 0.995 | 1.97 |
 
-(`697ff18-dirty-*` were produced on top of commit 697ff18 with the ranker key-order fix and message
-change of the verification pass uncommitted; `scripts/regenerate_results.sh` re-creates them with a
-clean sha after committing. Scores are identical before and after that fix.)
+(`scripts/regenerate_results.sh` re-creates the four headline files — including the clean-clone
+offline run — for the current commit.)
 
 Per scenario (HR / MRR / MTTC, full lists → gate): buying 1.000 / 0.771 / 1.09 → 1.000 / 1.000 / 1.48;
 browsing 1.000 / 0.674 / 1.21 → 1.000 / 1.000 / 1.79; intent override 1.000 / 0.967 / 3.60 (both; the
@@ -170,7 +170,7 @@ the private set could differ: different card generation, paraphrased templates, 
 Hit Rate stays at 1.000 in every row but one (the gate loses a single override session when cards
 are generated without the material/colour insertion), and the gate never scores below the full-list
 variant — the reason it is the default. Paraphrasing costs MRR, not hits: the exact tiers stop firing
-and the substring / popularity tiers carry the session. Source: `results/697ff18-dirty-perturb.json` / `.md`.
+and the substring / popularity tiers carry the session. Source: `results/64220b8-perturb.json` / `.md`.
 
 ## Latency, tokens and cost
 
