@@ -9,6 +9,8 @@ from pathlib import Path
 import numpy as np
 from dotenv import load_dotenv
 
+from . import ask_policy
+
 # The organizer may score with no network. Default every Hugging Face client to offline mode before
 # any of those libraries is imported, so a missing model fails fast instead of hanging on retries.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -117,6 +119,7 @@ class Agent:
         self._asin_to_embedding_index: dict[str, int] = {}
         self._asin_to_product_text: dict[str, str] = {}
         self.embedding_model = None
+        self.ask_mode = os.getenv("AGENT_ASK_POLICY", "other").strip().lower()
         self.llm = self._init_llm()
         self._build_index()
         try:
@@ -252,7 +255,7 @@ class Agent:
             "override_requirement": "",
             "override_active": False,
             "focus_text": "",
-            "asked": set(),
+            "asked": [],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0},
         }
 
@@ -296,10 +299,13 @@ class Agent:
             state["override_requirement"] = self._override_query(user_message)
             messages.clear()
 
+        # Zero-information replies must not enter the retrieval text: they would only add noise.
         no_preference = (
             "don't have a preference" in lowered
             or "no preference" in lowered
             or "use your judgment" in lowered
+            or "additional preference" in lowered
+            or "not quite right" in lowered
         )
 
         if not no_preference:
@@ -402,24 +408,17 @@ class Agent:
         ]
 
 
-    def _ask_attribute(self, state: dict, turn: int, user_message: str) -> str | None:
-        lowered = user_message.lower()
-        if turn >= 7:
-            return None
+    def _ask_attribute(self, state: dict, turn: int, user_message: str) -> str:
+        """Question policy: ask every turn (a null ask yields a zero-information reply).
 
-        if "don't have a preference" in lowered or "not quite right" in lowered:
-            priority = ["feature", "style", "material", "color", "use_case", "brand", "size", "budget"]
-        elif turn <= 2:
-            priority = ["feature", "material", "style", "color", "use_case", "brand", "size", "budget"]
-        else:
-            priority = ["material", "style", "feature", "color", "use_case", "brand", "size", "budget"]
-
-        asked: set[str] = state["asked"]
-        for attribute in priority:
-            if attribute not in asked:
-                asked.add(attribute)
-                return attribute
-        return None
+        The simulator reveals at most two undisclosed constraints per ask and "other" matches every
+        constraint class, so the fixed policy asks "other" on every turn, including after a
+        "no preference" reply. AGENT_ASK_POLICY=value switches to the question-value estimate once a
+        structural catalog index is available (see ask_policy.choose_attribute).
+        """
+        attribute = ask_policy.choose_attribute(self.ask_mode, state, None, [], turn)
+        state["asked"].append(attribute)
+        return attribute
 
     def respond(
         self,
@@ -469,7 +468,7 @@ class Agent:
                 + (f" and want to ask about their {ask_attribute}." if ask_attribute else ".")
             ),
             max_tokens=60,
-        ) or "Here are the closest matches I found. I can narrow them further with one more detail."
+        ) or ("Here are the closest matches I found. " + ask_policy.question_for(ask_attribute))
 
         return {
             "message": message,
