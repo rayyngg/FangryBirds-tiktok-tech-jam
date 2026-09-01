@@ -50,7 +50,7 @@ Our first agent was a hybrid of SQLite BM25 and MiniLM embeddings with a bag of 
 - Asking about attribute *a* reveals the next two undisclosed constraints of class *a*, word for word. Asking `other` reveals the next two of any class. So `other` twice discloses the whole card, and `brand` or `category` never reveal anything.
 - The target sits at the 99th popularity percentile of its bucket (median), so `rating_number` is a strong prior before any constraint arrives.
 - In override sessions the "earlier preference" the customer asks us to ignore is a true property of the target, and hits before the override turn are not scored.
-- The harness does not catch exceptions in the agent's constructor, and the organizer may disable network access for final scoring.
+- The harness does not catch exceptions in the agent's constructor, so construction has to be bulletproof.
 
 Everything below follows from those facts. Where the private set might behave differently, we measured what happens rather than guessed (see the robustness study).
 
@@ -107,7 +107,7 @@ Parameters chosen on the public set, all listed here so nothing is hidden: the s
 
 ## Robustness study (`scripts/perturb_eval.py`)
 
-The private set is scored by the same harness on 800 unseen sessions, and the specification says the organizer may add paraphrasing. We could not test that directly, so we changed the simulator at runtime (the evaluator file is untouched) in ten ways the private set might differ, and ran the unchanged agent against each.
+The final set is 800 unseen sessions scored by the same harness. When we built this, the specification left room for the organizer to paraphrase the customer's messages; the organizer's final-evaluation FAQ, published on 1 September, confirms the same deterministic templates and the same card policy will be used. We had already tested the harder case: we changed the simulator at runtime (the evaluator file is untouched) in ten ways the final set might have differed, and ran the unchanged agent against each.
 
 | change to the simulator | full lists, score (HR / MRR / MTTC) | gate, score (HR / MRR / MTTC) |
 |---|---|---|
